@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 authors = ["Ho Kim <ho.kim@ulagbulag.io>"]
-description = "Open Transparent Forward Proxy for Rendering Cross-Origin Services"
+description = "Open Transparent Forward Proxy Service for Rendering Cross-Origin Services"
 documentation = "https://docs.rs/open-transparent-proxy"
 license = "AGPL-3.0"
 readme = "./README.md"
