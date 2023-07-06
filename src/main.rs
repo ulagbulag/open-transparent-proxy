@@ -110,7 +110,7 @@ async fn resolve(
     let (res, status) = match builder.send().await {
         Ok(res) => {
             let status = res.status();
-            info!("[{method}] {peer_addr} => /{path} => {status}");
+            info!("[{method}] {peer_addr} => /{path}{query} => {status}");
             (res, status)
         }
         Err(e) => {
@@ -148,11 +148,30 @@ async fn resolve(
             Ok(content_type) => match content_type.parse::<::mime::Mime>() {
                 Ok(mime) => match mime.subtype() {
                     ::mime::HTML => match res.text().await {
-                        Ok(body) => builder.body(body),
+                        Ok(body) => {
+                            let body = {
+                                let re = Regex::new(r#"(href=")/"#).unwrap();
+                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                            };
+                            let body = {
+                                let re = Regex::new(r#"(src=")/"#).unwrap();
+                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                            };
+                            let body = {
+                                let re = Regex::new(r#"(url=")/"#).unwrap();
+                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                            };
+                            let body = {
+                                let re = Regex::new(r#"<head[ \.\_\-\=A-Za-z0-9'"]*>"#).unwrap();
+                                re.replace_all(&body, format!(r#"$0<base href="{base_url}">"#))
+                                    .to_string()
+                            };
+                            builder.body(body)
+                        }
                         Err(e) => HttpResponse::Forbidden()
                             .body(format!("failed to parse the response body as string: {e}")),
                     },
-                    ::mime::JAVASCRIPT | _ => respond_pass_through(builder, res),
+                    _ => respond_pass_through(builder, res),
                 },
                 Err(e) => HttpResponse::Forbidden()
                     .body(format!("failed to parse the response content type: {e}")),
