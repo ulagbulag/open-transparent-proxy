@@ -14,10 +14,19 @@ repository = "https://github.com/ulagbulag/OpenARK"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["compression", "tls-rustls"]
+default = ["compression", "filter-all", "tls-rustls"]
 
+# Filters
+filter-all = ["filter-html", "filter-notion"]
+
+## Filters :: each
+filter-html = ["regex"]
+filter-notion = ["regex"]
+
+# HTTP
 compression = ["reqwest/brotli", "reqwest/deflate", "reqwest/gzip"]
 
+# TLS
 tls-default = ["reqwest/default-tls"]
 tls-native = ["reqwest/native-tls"]
 tls-rustls = ["reqwest/rustls-tls"]
@@ -33,10 +42,12 @@ futures = { version = "0.3" }
 # http-cache-reqwest = { version = "0.10" }
 log = { version = "0.4" }
 mime = { version = "0.3" }
-regex = { version = "1.8" }
+paste = { version = "1.0" }
+regex = { version = "1.8", optional = true }
 reqwest = { version = "0.11", default-features = false, features = [
     "socks",
     "stream",
 ] }
 # reqwest-middleware = { version = "0.2" }
 serde = { version = "1.0", features = ["derive"] }
+strfmt = { version = "0.2" }

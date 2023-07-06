@@ -1,3 +1,6 @@
+mod config;
+mod filters;
+
 use std::net::SocketAddr;
 
 use actix_web::{
@@ -6,17 +9,21 @@ use actix_web::{
 };
 use anyhow::{anyhow, Result};
 use ark_core::{env, logger};
+use filters::ResponseFilters;
 use futures::StreamExt;
 use log::{info, warn};
-use regex::Regex;
 use reqwest::{
     header::{self, HeaderName, HeaderValue},
     Client, Method,
 };
 
+use crate::{
+    config::{Config, ConfigMap},
+    filters::{DefaultResponseFilter, ResponseFilter, ResponseFilterBuilder},
+};
+
 async fn resolve(
-    client: web::Data<Client>,
-    config: web::Data<Config>,
+    context: web::Data<Context>,
     req: HttpRequest,
     method: Method,
     mut payload: web::Payload,
@@ -36,18 +43,37 @@ async fn resolve(
             .and_then(|value| HeaderValue::from_str(&value).map_err(|_| error()))
     }
 
-    // load proxy config
-    let Config {
-        base_url,
-        proxy_base_url,
-        proxy_base_url_with_host,
-        proxy_host,
-        proxy_scheme,
-    } = &**config;
+    // load proxy context
+    let Context {
+        client,
+        config:
+            Config {
+                base_url,
+                proxy_base_url,
+                proxy_base_url_with_host,
+                proxy_host,
+                proxy_scheme,
+            },
+        config_map,
+        filters,
+    } = &**context;
 
     // get basic request information
-    let scheme = req.connection_info().scheme().to_string();
-    let host = req.connection_info().host().to_string();
+    let mut config_map = config_map.clone();
+
+    #[must_use]
+    fn get_param(map: &mut ConfigMap, key: &'static str, value: impl FnOnce() -> String) -> String {
+        let value = value();
+        map.insert(key.into(), value.clone());
+        value
+    }
+
+    let _scheme = get_param(&mut config_map, "scheme", || {
+        req.connection_info().scheme().to_string()
+    });
+    let host = get_param(&mut config_map, "host", || {
+        req.connection_info().host().to_string()
+    });
     let peer_addr = req
         .peer_addr()
         .map(|addr| addr.to_string())
@@ -75,7 +101,7 @@ async fn resolve(
             header::ACCEPT_ENCODING => Ok(None),
             header::CONNECTION => Ok(None),
             header::HOST | header::ORIGIN | header::REFERER => {
-                patch_host(key, value, &host, &config.proxy_host).map(Some)
+                patch_host(key, value, &host, proxy_host).map(Some)
             }
             ref key if key == header::HeaderName::from_static("x-forwarded-host") => Ok(None),
             _ => Ok(Some(value.clone())),
@@ -138,7 +164,7 @@ async fn resolve(
             header::CONTENT_ENCODING => {}
             header::CONTENT_LENGTH => {}
             header::CONTENT_SECURITY_POLICY => {}
-            _ => match patch_host(key, value, &config.proxy_host, &host) {
+            _ => match patch_host(key, value, proxy_host, &host) {
                 Ok(value) => {
                     builder.append_header((key, value));
                 }
@@ -163,25 +189,7 @@ async fn resolve(
             Ok(content_type) => match content_type.parse::<::mime::Mime>() {
                 Ok(mime) => match mime.subtype() {
                     ::mime::HTML => match res.text().await {
-                        Ok(body) => {
-                            let body = {
-                                let re = Regex::new(r#"(href=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#))
-                            };
-                            let body = {
-                                let re = Regex::new(r#"(src=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#))
-                            };
-                            let body = {
-                                let re = Regex::new(r#"(url=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#))
-                            };
-                            let body = {
-                                let re = Regex::new(r#"<head[ \.\_\-\=A-Za-z0-9'"]*>"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0<base href="{base_url}">"#))
-                            };
-                            builder.body(body.to_string())
-                        }
+                        Ok(body) => builder.body(filters.filter(&config_map, body)),
                         Err(e) => HttpResponse::Forbidden()
                             .body(format!("failed to parse the response body as string: {e}")),
                     },
@@ -198,32 +206,11 @@ async fn resolve(
     }
 }
 
-struct Config {
-    base_url: String,
-    proxy_base_url: String,
-    proxy_base_url_with_host: String,
-    proxy_host: String,
-    proxy_scheme: String,
-}
-
-impl Config {
-    fn try_default() -> Result<Self> {
-        let base_url = env::infer_string("BASE_URL").unwrap_or_else(|_| "/".into());
-        let proxy_base_url =
-            env::infer_string("PROXY_BASE_URL").unwrap_or_else(|_| base_url.clone());
-        let proxy_host = env::infer_string("PROXY_HOST")?;
-        let proxy_scheme = env::infer_string("PROXY_SCHEME").unwrap_or_else(|_| "https".into());
-
-        let proxy_base_url_with_host = format!("{proxy_host}{proxy_base_url}");
-
-        Ok(Self {
-            base_url,
-            proxy_base_url,
-            proxy_base_url_with_host,
-            proxy_host,
-            proxy_scheme,
-        })
-    }
+struct Context {
+    client: Client,
+    config: Config,
+    config_map: ConfigMap,
+    filters: ResponseFilters,
 }
 
 #[actix_web::main]
@@ -256,20 +243,28 @@ async fn main() {
         //     }
         //     builder.build()
         // };
-        let client = web::Data::new(client);
 
         // Initialize config
         let config = Config::try_default().map_err(|e| anyhow!("failed to parse config: {e}"))?;
-        let config = web::Data::new(config);
+        let config_map = config.to_map();
+
+        // Initialize filter
+        let filters = DefaultResponseFilter.try_build()?;
+
+        let context = web::Data::new(Context {
+            client,
+            config,
+            config_map,
+            filters,
+        });
 
         // Initialize path
-        let path = format!("{base_url}{{path:.*}}", base_url = &config.base_url,);
+        let path = format!("{base_url}{{path:.*}}", base_url = &context.config.base_url,);
 
         // Start web server
         HttpServer::new(move || {
             App::new()
-                .app_data(web::Data::clone(&client))
-                .app_data(web::Data::clone(&config))
+                .app_data(web::Data::clone(&context))
                 .route(&path, web::route().to(resolve))
         })
         .bind(addr)
