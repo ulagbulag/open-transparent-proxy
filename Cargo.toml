@@ -22,6 +22,8 @@ actix-web = { version = "4.3", default-features = false, features = ["rustls"] }
 # actix-web-lab = { version = "0.19" }
 futures = { version = "0.3" }
 log = { version = "0.4" }
+mime = { version = "0.3" }
+regex = { version = "1.8" }
 reqwest = { version = "0.11", default-features = false, features = [
     "json",
     "rustls-tls",

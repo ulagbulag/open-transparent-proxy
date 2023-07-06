@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use actix_web::{
     web::{self, BytesMut},
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
+    App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder,
 };
 use anyhow::{anyhow, Result};
 use ark_core::{
@@ -11,6 +11,7 @@ use ark_core::{
 };
 use futures::StreamExt;
 use log::{info, warn};
+use regex::Regex;
 use reqwest::{
     header::{self, HeaderName, HeaderValue},
     Client, ClientBuilder, Method,
@@ -24,39 +25,49 @@ async fn resolve(
     mut payload: web::Payload,
     path: web::Path<String>,
 ) -> impl Responder {
+    fn patch_host(
+        key: &HeaderName,
+        value: &HeaderValue,
+        src: &str,
+        target: &str,
+    ) -> Result<HeaderValue> {
+        let error = || anyhow!("invalid header: {key}");
+
+        value
+            .to_str()
+            .map_err(|_| error())
+            .map(|value| value.replace(src, target))
+            .and_then(|value| HeaderValue::from_str(&value).map_err(|_| error()))
+    }
+
     let scheme = req.connection_info().scheme().to_string();
     let host = req.connection_info().host().to_string();
     let path = path.into_inner();
+    let peer_addr = req
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let query = match req.query_string() {
+        "" => Default::default(),
+        query => format!("?{query}"),
+    };
 
     let Config {
         base_url,
         proxy_base_url,
         proxy_base_url_with_host,
         proxy_host,
+        proxy_scheme,
     } = &**config;
 
     let mut builder = client.request(
         method.clone(),
-        format!("{scheme}://{proxy_host}{proxy_base_url}{path}"),
+        format!("{proxy_scheme}://{proxy_host}{proxy_base_url}{path}{query}"),
     );
 
     for (key, value) in req.headers() {
-        fn patch_host(
-            key: &HeaderName,
-            value: &HeaderValue,
-            src: &str,
-            target: &str,
-        ) -> Result<HeaderValue> {
-            let error = || anyhow!("invalid header: {key}");
-
-            value
-                .to_str()
-                .map_err(|_| error())
-                .map(|value| value.replace(src, target))
-                .and_then(|value| HeaderValue::from_str(&value).map_err(|_| error()))
-        }
-
         match match *key {
+            header::ACCEPT_ENCODING => Ok(None),
             header::HOST => patch_host(key, value, &host, &config.proxy_host).map(Some),
             header::ORIGIN => patch_host(key, value, &host, &config.proxy_host).map(Some),
             header::REFERER => patch_host(key, value, &host, &config.proxy_host).map(Some),
@@ -66,17 +77,6 @@ async fn resolve(
             Ok(Some(value)) => builder = builder.header(key, value),
             Ok(None) => {}
             Err(e) => return HttpResponse::Forbidden().body(e.to_string()),
-        }
-
-        if ![
-            header::HOST,
-            header::ORIGIN,
-            header::REFERER,
-            header::HeaderName::from_static("x-forwarded-host"),
-        ]
-        .contains(key)
-        {
-            builder = builder.header(key, value);
         }
     }
 
@@ -107,23 +107,61 @@ async fn resolve(
         Err(e) => return HttpResponse::Forbidden().body(e.to_string()),
     };
 
-    match builder.send().await {
+    let (res, status) = match builder.send().await {
         Ok(res) => {
-            let content_length = res.content_length();
             let status = res.status();
-            info!("[{method}] {path:?} => {status}");
-
-            let mut builder = HttpResponse::build(status);
-            for (key, value) in res.headers() {
-                builder.append_header((key, value));
-            }
-            if let Some(content_length) = content_length {
-                builder.no_chunking(content_length);
-            }
-
-            builder.streaming(res.bytes_stream())
+            info!("[{method}] {peer_addr} => /{path} => {status}");
+            (res, status)
         }
-        Err(e) => HttpResponse::Forbidden().body(format!("failed to find the url {path:?}: {e}")),
+        Err(e) => {
+            return HttpResponse::Forbidden().body(format!("failed to find the url {path:?}: {e}"))
+        }
+    };
+
+    let mut builder = HttpResponse::build(status);
+    for (key, value) in res.headers() {
+        match *key {
+            header::CONTENT_ENCODING => {}
+            header::CONTENT_LENGTH => {}
+            header::CONTENT_SECURITY_POLICY => {}
+            _ => match patch_host(key, value, &config.proxy_host, &host) {
+                Ok(value) => {
+                    builder.append_header((key, value));
+                }
+                Err(e) => return HttpResponse::Forbidden().body(e.to_string()),
+            },
+        }
+    }
+
+    fn respond_pass_through(
+        mut builder: HttpResponseBuilder,
+        res: ::reqwest::Response,
+    ) -> HttpResponse {
+        if let Some(content_length) = res.content_length() {
+            builder.no_chunking(content_length);
+        }
+        builder.streaming(res.bytes_stream())
+    }
+
+    match res.headers().get(header::CONTENT_TYPE) {
+        Some(content_type) => match content_type.to_str() {
+            Ok(content_type) => match content_type.parse::<::mime::Mime>() {
+                Ok(mime) => match mime.subtype() {
+                    ::mime::HTML => match res.text().await {
+                        Ok(body) => builder.body(body),
+                        Err(e) => HttpResponse::Forbidden()
+                            .body(format!("failed to parse the response body as string: {e}")),
+                    },
+                    ::mime::JAVASCRIPT | _ => respond_pass_through(builder, res),
+                },
+                Err(e) => HttpResponse::Forbidden()
+                    .body(format!("failed to parse the response content type: {e}")),
+            },
+            Err(e) => HttpResponse::Forbidden().body(format!(
+                "failed to parse the response content type as string: {e}"
+            )),
+        },
+        None => respond_pass_through(builder, res),
     }
 }
 
@@ -132,6 +170,7 @@ struct Config {
     proxy_base_url: String,
     proxy_base_url_with_host: String,
     proxy_host: String,
+    proxy_scheme: String,
 }
 
 impl Config {
@@ -140,6 +179,7 @@ impl Config {
         let proxy_base_url =
             env::infer_string("PROXY_BASE_URL").unwrap_or_else(|_| base_url.clone());
         let proxy_host = env::infer_string("PROXY_HOST")?;
+        let proxy_scheme = env::infer_string("PROXY_SCHEME").unwrap_or_else(|_| "https".into());
 
         let proxy_base_url_with_host = format!("{proxy_host}{proxy_base_url}");
 
@@ -148,6 +188,7 @@ impl Config {
             proxy_base_url,
             proxy_base_url_with_host,
             proxy_host,
+            proxy_scheme,
         })
     }
 }
@@ -170,7 +211,7 @@ async fn main() {
             Config::try_default().map_err(|e| anyhow!("failed to parse config: {e}"))?,
         );
 
-        let path = format!("/{base_url}{{path:.*}}", base_url = &config.base_url,);
+        let path = format!("{base_url}{{path:.*}}", base_url = &config.base_url,);
 
         // Start web server
         HttpServer::new(move || {
@@ -181,6 +222,7 @@ async fn main() {
         })
         .bind(addr)
         .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"))
+        .shutdown_timeout(20)
         .run()
         .await
         .map_err(Into::into)
