@@ -74,10 +74,10 @@ async fn resolve(
     let mut builder = client.request(method.clone(), &proxy_url);
     for (key, value) in req.headers() {
         match match *key {
-            header::ACCEPT_ENCODING => Ok(None),
-            header::HOST => patch_host(key, value, &host, &config.proxy_host).map(Some),
-            header::ORIGIN => patch_host(key, value, &host, &config.proxy_host).map(Some),
-            header::REFERER => patch_host(key, value, &host, &config.proxy_host).map(Some),
+            header::ACCEPT_ENCODING | header::CONNECTION => Ok(None),
+            header::HOST | header::ORIGIN | header::REFERER => {
+                patch_host(key, value, &host, &config.proxy_host).map(Some)
+            }
             ref key if key == header::HeaderName::from_static("x-forwarded-host") => Ok(None),
             _ => Ok(Some(value.clone())),
         } {
