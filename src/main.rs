@@ -58,6 +58,14 @@ async fn resolve(
         filters,
     } = &**context;
 
+    // parse path
+    let path = req.path();
+    let path = if path.starts_with(base_url) {
+        &path[base_url.len()..]
+    } else {
+        path
+    };
+
     // get basic request information
     let mut config_map = config_map.clone();
 
@@ -74,6 +82,7 @@ async fn resolve(
     let host = get_param(&mut config_map, "host", || {
         req.connection_info().host().to_string()
     });
+    let base_url_with_host = format!("{host}{base_url}");
     let peer_addr = req
         .peer_addr()
         .map(|addr| addr.to_string())
@@ -83,13 +92,7 @@ async fn resolve(
         query => format!("?{query}"),
     };
 
-    // parse path
-    let path = req.path();
-    let path = if path.starts_with(base_url) {
-        &path[base_url.len()..]
-    } else {
-        path
-    };
+    // get proxy path
     let proxy_path = format!("{proxy_base_url}{path}{query}");
     let proxy_url = format!("{proxy_scheme}://{proxy_host}{proxy_path}");
 
@@ -100,8 +103,11 @@ async fn resolve(
             #[cfg(not(feature = "compression"))]
             header::ACCEPT_ENCODING => Ok(None),
             header::CONNECTION => Ok(None),
-            header::HOST | header::ORIGIN | header::REFERER => {
-                patch_host(key, value, &host, proxy_host).map(Some)
+            header::HOST => patch_host(key, value, &host, proxy_host).map(Some),
+            header::ORIGIN | header::REFERER => {
+                patch_host(key, value, &base_url_with_host, proxy_base_url_with_host)
+                    .and_then(|value| patch_host(key, &value, &host, proxy_host))
+                    .map(Some)
             }
             ref key if key == header::HeaderName::from_static("x-forwarded-host") => Ok(None),
             _ => Ok(Some(value.clone())),
