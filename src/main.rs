@@ -23,7 +23,6 @@ async fn resolve(
     req: HttpRequest,
     method: Method,
     mut payload: web::Payload,
-    path: web::Path<String>,
 ) -> impl Responder {
     fn patch_host(
         key: &HeaderName,
@@ -40,9 +39,18 @@ async fn resolve(
             .and_then(|value| HeaderValue::from_str(&value).map_err(|_| error()))
     }
 
+    // load proxy config
+    let Config {
+        base_url,
+        proxy_base_url,
+        proxy_base_url_with_host,
+        proxy_host,
+        proxy_scheme,
+    } = &**config;
+
+    // get basic request information
     let scheme = req.connection_info().scheme().to_string();
     let host = req.connection_info().host().to_string();
-    let path = path.into_inner();
     let peer_addr = req
         .peer_addr()
         .map(|addr| addr.to_string())
@@ -52,19 +60,18 @@ async fn resolve(
         query => format!("?{query}"),
     };
 
-    let Config {
-        base_url,
-        proxy_base_url,
-        proxy_base_url_with_host,
-        proxy_host,
-        proxy_scheme,
-    } = &**config;
+    // parse path
+    let path = req.path();
+    let path = if path.starts_with(base_url) {
+        &path[base_url.len()..]
+    } else {
+        path
+    };
+    let proxy_path = format!("{proxy_base_url}{path}{query}");
+    let proxy_url = format!("{proxy_scheme}://{proxy_host}{proxy_path}");
 
-    let mut builder = client.request(
-        method.clone(),
-        format!("{proxy_scheme}://{proxy_host}{proxy_base_url}{path}{query}"),
-    );
-
+    // define a request
+    let mut builder = client.request(method.clone(), &proxy_url);
     for (key, value) in req.headers() {
         match match *key {
             header::ACCEPT_ENCODING => Ok(None),
@@ -80,33 +87,40 @@ async fn resolve(
         }
     }
 
-    // payload is a stream of Bytes objects
+    // load a payload, which is a stream of Bytes objects
     let body = 'body: {
-        let mut buf = BytesMut::new();
-        while let Some(chunk) = payload.next().await {
-            const MAX_SIZE: usize = 262_144; // max payload size is 256k
+        match method {
+            Method::PATCH | Method::POST | Method::PUT => {
+                let mut buf = BytesMut::new();
+                while let Some(chunk) = payload.next().await {
+                    const MAX_SIZE: usize = 262_144; // max payload size is 256k
 
-            match chunk {
-                // limit max size of in-memory payload
-                Ok(chunk) if (buf.len() + chunk.len()) <= MAX_SIZE => {
-                    buf.extend_from_slice(&chunk);
+                    match chunk {
+                        // limit max size of in-memory payload
+                        Ok(chunk) if (buf.len() + chunk.len()) <= MAX_SIZE => {
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(_) => {
+                            break 'body Err("Overflowed");
+                        }
+                        Err(e) => {
+                            warn!("failed to get bytes: {e}");
+                            break 'body Err("Err");
+                        }
+                    }
                 }
-                Ok(_) => {
-                    break 'body Err("Overflowed");
-                }
-                Err(e) => {
-                    warn!("failed to get bytes: {e}");
-                    break 'body Err("Err");
-                }
+                Ok(Some(buf.freeze()))
             }
+            _ => Ok(None),
         }
-        Ok(buf.freeze())
     };
     builder = match body {
-        Ok(body) => builder.body(body),
+        Ok(Some(body)) => builder.body(body),
+        Ok(None) => builder,
         Err(e) => return HttpResponse::Forbidden().body(e.to_string()),
     };
 
+    // call a proxy request
     let (res, status) = match builder.send().await {
         Ok(res) => {
             let status = res.status();
@@ -118,6 +132,7 @@ async fn resolve(
         }
     };
 
+    // define a response builder
     let mut builder = HttpResponse::build(status);
     for (key, value) in res.headers() {
         match *key {
@@ -143,6 +158,7 @@ async fn resolve(
         builder.streaming(res.bytes_stream())
     }
 
+    // send a response
     match res.headers().get(header::CONTENT_TYPE) {
         Some(content_type) => match content_type.to_str() {
             Ok(content_type) => match content_type.parse::<::mime::Mime>() {
@@ -151,22 +167,21 @@ async fn resolve(
                         Ok(body) => {
                             let body = {
                                 let re = Regex::new(r#"(href=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                                re.replace_all(&body, format!(r#"$0"#))
                             };
                             let body = {
                                 let re = Regex::new(r#"(src=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                                re.replace_all(&body, format!(r#"$0"#))
                             };
                             let body = {
                                 let re = Regex::new(r#"(url=")/"#).unwrap();
-                                re.replace_all(&body, format!(r#"$0"#)).to_string()
+                                re.replace_all(&body, format!(r#"$0"#))
                             };
                             let body = {
                                 let re = Regex::new(r#"<head[ \.\_\-\=A-Za-z0-9'"]*>"#).unwrap();
                                 re.replace_all(&body, format!(r#"$0<base href="{base_url}">"#))
-                                    .to_string()
                             };
-                            builder.body(body)
+                            builder.body(body.to_string())
                         }
                         Err(e) => HttpResponse::Forbidden()
                             .body(format!("failed to parse the response body as string: {e}")),
