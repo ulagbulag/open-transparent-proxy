@@ -5,16 +5,13 @@ use actix_web::{
     App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder,
 };
 use anyhow::{anyhow, Result};
-use ark_core::{
-    env::{self, infer},
-    logger,
-};
+use ark_core::{env, logger};
 use futures::StreamExt;
 use log::{info, warn};
 use regex::Regex;
 use reqwest::{
     header::{self, HeaderName, HeaderValue},
-    Client, ClientBuilder, Method,
+    Client, Method,
 };
 
 async fn resolve(
@@ -74,7 +71,9 @@ async fn resolve(
     let mut builder = client.request(method.clone(), &proxy_url);
     for (key, value) in req.headers() {
         match match *key {
-            header::ACCEPT_ENCODING | header::CONNECTION => Ok(None),
+            #[cfg(not(feature = "compression"))]
+            header::ACCEPT_ENCODING => Ok(None),
+            header::CONNECTION => Ok(None),
             header::HOST | header::ORIGIN | header::REFERER => {
                 patch_host(key, value, &host, &config.proxy_host).map(Some)
             }
@@ -128,7 +127,7 @@ async fn resolve(
             (res, status)
         }
         Err(e) => {
-            return HttpResponse::Forbidden().body(format!("failed to find the url {path:?}: {e}"))
+            return HttpResponse::Forbidden().body(format!("failed to find the url (/{path}): {e}"))
         }
     };
 
@@ -231,20 +230,39 @@ impl Config {
 async fn main() {
     async fn try_main() -> Result<()> {
         // Initialize kubernetes client
-        let addr =
-            infer::<_, SocketAddr>("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:80".parse().unwrap());
+        let addr = env::infer::<_, SocketAddr>("BIND_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:80".parse().unwrap());
 
         // Initialize client
-        let client = web::Data::new({
-            let builder = ClientBuilder::new();
+        let client = {
+            let builder = ::reqwest::ClientBuilder::new();
             builder
                 .build()
                 .map_err(|e| anyhow!("failed to init reqwest client: {e}"))?
-        });
-        let config = web::Data::new(
-            Config::try_default().map_err(|e| anyhow!("failed to parse config: {e}"))?,
-        );
+        };
+        // let client = {
+        //     let mut builder = ::reqwest_middleware::ClientBuilder::new(client);
+        //     if env::infer::<_, bool>("CACHE_ENABLE").unwrap_or_default() {
+        //         builder = builder.with(::http_cache_reqwest::Cache(
+        //             ::http_cache_reqwest::HttpCache {
+        //                 mode: ::http_cache_reqwest::CacheMode::Default,
+        //                 manager: ::http_cache_reqwest::CACacheManager {
+        //                     path: env::infer("CACHE_DIR")
+        //                         .unwrap_or_else(|_| "./http-cacache".into()),
+        //                 },
+        //                 options: None,
+        //             },
+        //         ));
+        //     }
+        //     builder.build()
+        // };
+        let client = web::Data::new(client);
 
+        // Initialize config
+        let config = Config::try_default().map_err(|e| anyhow!("failed to parse config: {e}"))?;
+        let config = web::Data::new(config);
+
+        // Initialize path
         let path = format!("{base_url}{{path:.*}}", base_url = &config.base_url,);
 
         // Start web server
