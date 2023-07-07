@@ -82,7 +82,9 @@ async fn resolve(
     let host = get_param(&mut config_map, "host", || {
         req.connection_info().host().to_string()
     });
-    let base_url_with_host = format!("{host}{base_url}");
+    let base_url_with_host = get_param(&mut config_map, "base_url_with_host", || {
+        format!("{host}{base_url}")
+    });
     let peer_addr = req
         .peer_addr()
         .map(|addr| addr.to_string())
